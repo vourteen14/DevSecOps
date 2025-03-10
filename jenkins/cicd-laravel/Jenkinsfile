@@ -1,0 +1,398 @@
+pipeline {
+    agent any
+
+    triggers {
+        GenericTrigger(
+            genericVariables: [
+                [key: 'json', value: '$', expressionType: 'JSONPath', defaultValue: '{}']
+            ],
+            token: '785f15897f6ac0b9ae377dd76c56e5c3',
+        )
+    }
+    
+    environment {
+        SONAR_SCANNER_PATH = "/opt/sonar-scanner/bin"
+        PATH = "${SONAR_SCANNER_PATH}:$PATH"
+        DOCKER_REGISTRY = "docker.io"
+        KUBECONFIG = credentials('KUBECONFIG')
+    }
+
+    stages {
+        stage('Parse Webhook Result') {
+            steps {
+                script {
+                    def jsonString = env.json ?: '{}'
+                    def parsedJson = new groovy.json.JsonSlurper().parseText(jsonString)
+        
+                    env.ACTION = parsedJson.action
+                    env.TAG = parsedJson.release.tag_name
+                    env.BRANCH = parsedJson.repository.default_branch
+                    env.SSH_URL = parsedJson.repository.ssh_url
+                    env.RELEASE_BODY = parsedJson.release.body
+                    env.REPOSITORY_NAME = parsedJson.repository.name
+                    env.PWD = pwd()
+        
+                    if (!env.RELEASE_BODY.trim()) {
+                        echo "No release body found. Skipping parsing."
+                        currentBuild.result = 'ABORTED'
+                        return
+                    }
+        
+                    def body = env.RELEASE_BODY.replaceAll("\r\n", "\n")
+        
+                    def parsedData = [:]
+                    def rollbackApps = [:]
+                    def isRollbackSection = false
+        
+                    body.split("\n").each { line ->
+                        line = line.trim()
+        
+                        if (line.isEmpty()) {
+                            return
+                        }
+        
+                        if (line.startsWith("ROLLBACK:")) {
+                            isRollbackSection = true 
+                            return
+                        }
+        
+                        if (isRollbackSection && line.startsWith("- ")) {
+                            def rollbackEntry = line.substring(2).split("=", 2)
+                            if (rollbackEntry.size() == 2) {
+                                rollbackApps[rollbackEntry[0].trim()] = rollbackEntry[1].trim()
+                            }
+                        } else {
+                            def parts = line.split(":", 2)
+                            if (parts.size() == 2) {
+                                parsedData[parts[0].trim()] = parts[1].trim()
+                            }
+                        }
+                    }
+                    
+                    env.MIGRATION = parsedData.getOrDefault("MIGRATION", "no")
+                    env.VERSION = parsedData.getOrDefault("VERSION", "unknown")
+                    env.RELEASE = parsedData.getOrDefault("RELEASE", "unknown")
+                    env.ROLLBACK = rollbackApps ?: [:]
+        
+                    def rollbackStr = ROLLBACK.collect { k, v -> "${k}:${v}" }.join(", ")
+        
+                    if (env.ACTION != "released") {
+                        echo "Not a release action. Stopping pipeline."
+                        env.SKIPPED = 'true'
+                    } else {
+                        echo "Release action detected. Continuing pipeline."
+                    }
+                }
+            }
+        }
+        
+        stage('Checkout') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: "refs/tags/${TAG}"]],
+                            userRemoteConfigs: [[
+                                url: "${SSH_URL}",
+                                credentialsId: 'GITHUB_SSH_PRIVKEY'
+                            ]]
+                        ])
+                    }
+                }
+            }
+        }
+
+        stage('OWASP Dependency Check') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        sh " /var/lib/jenkins/tools/org.jenkinsci.plugins.DependencyCheck.tools.DependencyCheckInstallation/SCA/dependency-check/bin/dependency-check.sh --project devsecops-pipeline --scan . --format JENKINS --out reports"
+                    }
+                }
+            }
+        }
+        
+        stage('Publish Dependency Check HTML Report') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        publishHTML(target: [
+                            reportName: 'Dependency Check Report',
+                            reportDir: 'reports',
+                            reportFiles: 'dependency-check-jenkins.html',
+                            keepAll: true
+                        ])
+                    }
+                }
+            }
+        }
+        
+        stage('Static Code Analysis - SonarQube') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        withCredentials([
+                            string(credentialsId: 'SONARQUBE_TOKEN', variable: 'SONARQUBE_TOKEN'),
+                            string(credentialsId: 'SONARQUBE_HOST', variable: 'SONARQUBE_HOST')
+                        ]) {
+                            sh '''
+                                sonar-scanner \
+                                -Dsonar.projectKey=${REPOSITORY_NAME} \
+                                -Dsonar.sources=. \
+                                -Dsonar.host.url=${SONARQUBE_HOST} \
+                                -Dsonar.token=${SONARQUBE_TOKEN}
+                           '''
+                        }
+                    }
+                }
+            }
+        }
+    
+        stage('Login to Docker Registry') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        withCredentials([usernamePassword(credentialsId: 'DOCKER_CREDS', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+                            sh """
+                                echo \$DOCKER_PASSWORD | docker login -u \$DOCKER_USERNAME --password-stdin \$DOCKER_REGISTRY
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Build Docker Container') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        withCredentials([usernamePassword(credentialsId: 'DOCKER_CREDS', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+                            script {
+                                def dockerTag = "${DOCKER_USERNAME}/${REPOSITORY_NAME}:${TAG}"
+                                sh "docker build -t ${dockerTag} ."
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Start Docker Container for Unit Test') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        withCredentials([usernamePassword(credentialsId: 'DOCKER_CREDS', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+                            script {
+                                def dockerTag = "${DOCKER_USERNAME}/${REPOSITORY_NAME}:${TAG}"
+                                sh "mkdir -p ${env.PWD}/test_result"
+                                sh """
+                                    docker run -d \
+                                    --name devpsecops-vuln-laravel \
+                                    -e APP_KEY=base64:kwv+Q5o4HYkcVPaYM/x1JTdWrZ0w11rRe0NoQFjVx1o= \
+                                    -e DB_CONNECTION=sqlite \
+                                    -e DB_DATABASE=/tmp/database.sqlite \
+                                    ${dockerTag}
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Run Migrate in Docker Container for Unit Test') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        sh "docker exec devpsecops-vuln-laravel touch /tmp/database.sqlite"
+                        sh "docker exec devpsecops-vuln-laravel php artisan migrate --force"
+                    }
+                }
+            }
+        }
+
+        stage('Run Unit Tests') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        sh "mkdir -p .template"
+                        sh "mkdir -p test_result/_output"
+                        sh "sudo rm -f test_result/_output/junit.xml"
+                        sh "docker exec devpsecops-vuln-laravel mkdir -p /var/www/html/test_result"
+                        sh "docker exec devpsecops-vuln-laravel vendor/bin/phpunit --log-junit /var/www/html/test_result/_output/junit.xml"
+                        sh "docker cp devpsecops-vuln-laravel:/var/www/html/test_result/_output/junit.xml test_result/_output/junit-unit-test.xml"
+                    }
+                }
+            }
+        }
+    
+        stage('Publish Test Results - Unit Test') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        sh "sudo chown jenkins:jenkins test_result/_output/junit-unit-test.xml"
+                        sh "sudo chmod 644 test_result/_output/junit-unit-test.xml"
+                        junit "test_result/_output/junit-unit-test.xml"
+                    }
+                }
+            }
+        }
+      
+        stage('Prepare Trivy Template') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        sh '''
+                        wget https://raw.githubusercontent.com/aquasecurity/trivy/refs/heads/main/contrib/junit.tpl
+                        mv junit.tpl .template/trivy-junit.tpl
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Run Container Scan') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'DOCKER_CREDS', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+                    script {
+                        if (env.SKIPPED == 'true') {
+                            echo "Skip stage, this is not release.."
+                        } else {
+                            sh '''
+                            trivy --scanners vuln --format template --template "@.template/trivy-junit.tpl" -o test_result/_output/junit-trivy.xml image "${DOCKER_USERNAME}/${REPOSITORY_NAME}:${TAG}"
+                            '''   
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Publish Test Results - Container Scanning') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        junit allowEmptyResults: true, testResults: "test_result/_output/junit-trivy.xml"
+                    }
+                }
+            }
+        }
+
+        stage('Push Docker Containers') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'DOCKER_CREDS', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+                    script {
+                        if (env.SKIPPED == 'true') {
+                            echo "Skip stage, this is not release.."
+                        } else {
+                            def dockerTag = "${DOCKER_USERNAME}/${REPOSITORY_NAME}:${TAG}"
+                            def dockerEnv = "${DOCKER_USERNAME}/${REPOSITORY_NAME}:${RELEASE}"
+                            def dockerLatest = "${DOCKER_USERNAME}/${REPOSITORY_NAME}:latest"
+                            sh "docker tag ${dockerTag} ${dockerLatest}"
+                            sh "docker tag ${dockerTag} ${dockerEnv}"
+                            sh "docker push ${dockerTag}"
+                            sh "docker push ${dockerEnv}"
+                            sh "docker push ${dockerLatest}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Add and Update Helm Repository') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        sh "helm repo add devsecops https://vourteen14.github.io/devsecops-charts/"
+                        sh "helm repo update"
+                    }
+                }
+            }
+        }
+     
+        stage('Deploy to latest image to Kubernetes') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'DOCKER_CREDS', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+                    script {
+                        if (env.SKIPPED == 'true') {
+                            echo "Skip stage, this is not release.."
+                        } else {
+                            sh '''
+                            helm upgrade --install vulnerable-laravel-devsecops devsecops/devsecops-pipeline-staging \
+                              --namespace "${RELEASE}" \
+                              --set replicaCount=3 \
+                              --set image.repository="${DOCKER_USERNAME}/${REPOSITORY_NAME}" \
+                              --set image.tag="${TAG}" \
+                              --set secretName=secret-vulnerable-laravel-devsecops-pipeline-staging \
+                              --set ingress.hosts[0].host=dvs.angga-sr.xyz \
+                              --set ingress.hosts[0].paths[0].path="/" \
+                              --set ingress.hosts[0].paths[0].pathType=ImplementationSpecific \
+                            '''
+                        }
+                    }
+                }
+            }
+        } 
+        
+        stage('Check and Run migration if exits') {
+            steps {
+                script {
+                    if (env.SKIPPED == 'true') {
+                        echo "Skip stage, this is not release.."
+                    } else {
+                        def podName = sh(script: "kubectl get pod --no-headers -A -l app.kubernetes.io/name=devsecops-pipeline-staging | grep Running | awk 'NR==1 {print \$2}'", returnStdout: true).trim()
+                        if (env.MIGRATION == "yes") {
+                            sh "kubectl exec -n ${RELEASE} ${podName} -- php artisan migrate"
+                        } else {
+                            echo "Theres no migrations detected"
+                        }
+                    }
+                }
+            }
+        }
+        
+    }
+    post {
+        always {
+            withCredentials([usernamePassword(credentialsId: 'DOCKER_CREDS', usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+                script {
+                    def dockerTag = "${DOCKER_USERNAME}/${REPOSITORY_NAME}:${TAG}"
+                    def dockerEnv = "${DOCKER_USERNAME}/${REPOSITORY_NAME}:${RELEASE}"
+                    def dockerLatest = "${DOCKER_USERNAME}/${REPOSITORY_NAME}:latest"
+                    
+                    sh "docker stop devpsecops-vuln-laravel || true"
+                    sh "docker rm devpsecops-vuln-laravel || true"
+                    sh "docker rmi ${dockerTag} || true"
+                    sh "docker rmi ${dockerEnv} || true"
+                    sh "docker rmi ${dockerLatest} || true"
+                }
+            }
+        }
+    }
+}

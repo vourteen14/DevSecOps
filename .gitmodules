@@ -1,0 +1,6 @@
+[submodule "charts"]
+	path = charts
+	url = git@github.com:vourteen14/devsecops-charts.git
+[submodule "laravel-vulnerable"]
+	path = laravel-vulnerable
+	url = git@github.com:vourteen14/devsecops-laravel-vulnerable.git
